@@ -24,6 +24,11 @@ const (
 	EntryTypeLink
 )
 
+// Dialer interface is compatible with standard net.Dialer struct.
+type Dialer interface {
+	Dial(network, address string) (net.Conn, error)
+}
+
 // ServerConn represents the connection to a remote FTP server.
 // It should be protected from concurrent accesses.
 type ServerConn struct {
@@ -31,8 +36,8 @@ type ServerConn struct {
 	DisableEPSV bool
 
 	conn          *textproto.Conn
-	host          string
-	timeout       time.Duration
+	network, host string
+	dialer        Dialer
 	features      map[string]string
 	mlstSupported bool
 }
@@ -67,7 +72,12 @@ func Dial(addr string) (*ServerConn, error) {
 // It is generally followed by a call to Login() as most FTP commands require
 // an authenticated user.
 func DialTimeout(addr string, timeout time.Duration) (*ServerConn, error) {
-	tconn, err := net.DialTimeout("tcp", addr, timeout)
+	return DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", addr)
+}
+
+// DialWithDialer uses provided Dialer to dial the server.
+func DialWithDialer(dialer Dialer, network, address string) (*ServerConn, error) {
+	tconn, err := dialer.Dial(network, address)
 	if err != nil {
 		return nil, err
 	}
@@ -81,22 +91,33 @@ func DialTimeout(addr string, timeout time.Duration) (*ServerConn, error) {
 	}
 
 	conn := textproto.NewConn(tconn)
+	return (&SetupConn{
+		Dialer: dialer,
+		Conn:   conn,
+	}).SetupConnected(network, host)
+}
 
-	c := &ServerConn{
-		conn:     conn,
+type SetupConn struct {
+	Dialer Dialer
+	Conn   *textproto.Conn
+}
+
+// SetupConnected takes dialer, conn, network and host, then creates ServerConn.
+func (s *SetupConn) SetupConnected(network, host string) (*ServerConn, error) {
+	c := ServerConn{
+		conn:     s.Conn,
+		network:  network,
 		host:     host,
-		timeout:  timeout,
+		dialer:   s.Dialer,
 		features: make(map[string]string),
 	}
 
-	_, _, err = c.conn.ReadResponse(StatusReady)
-	if err != nil {
+	if _, _, err := c.conn.ReadResponse(StatusReady); err != nil {
 		c.Quit()
 		return nil, err
 	}
 
-	err = c.feat()
-	if err != nil {
+	if err := c.feat(); err != nil {
 		c.Quit()
 		return nil, err
 	}
@@ -105,7 +126,7 @@ func DialTimeout(addr string, timeout time.Duration) (*ServerConn, error) {
 		c.mlstSupported = true
 	}
 
-	return c, nil
+	return &c, nil
 }
 
 // Login authenticates the client with specified user and password.
@@ -282,7 +303,7 @@ func (c *ServerConn) openDataConn() (net.Conn, error) {
 		return nil, err
 	}
 
-	return net.DialTimeout("tcp", net.JoinHostPort(c.host, strconv.Itoa(port)), c.timeout)
+	return c.dialer.Dial(c.network, net.JoinHostPort(c.host, strconv.Itoa(port)))
 }
 
 // cmd is a helper function to execute a command and check for the expected FTP
